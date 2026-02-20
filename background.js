@@ -1,12 +1,13 @@
 importScripts('config.js');
 
-// ─── Alarms: Keep-Alive + Polling ───
+// ─── Alarms: Keep-Alive + Polling (Fallback only) ───
 chrome.alarms.create('keepAlive', { periodInMinutes: 0.25 });
-chrome.alarms.create('pollTasks', { periodInMinutes: 0.1 });
+chrome.alarms.create('pollTasks', { periodInMinutes: 1.0 }); // Giảm polling xuống 1 phút vì đã dùng SSE
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'keepAlive') {
     chrome.runtime.getPlatformInfo(() => { });
+    ensureSseConnection(); // Giữ kết nối SSE khi keep-alive chạy
   } else if (alarm.name === 'pollTasks') {
     pollForTasks();
   }
@@ -14,6 +15,50 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // Map requestId → pending request context
 const pendingRequests = new Map();
+
+// ─── Server-Sent Events (Real-time) ───
+let sseConnection = null;
+let reconnectTimeout = null;
+
+function ensureSseConnection() {
+  if (sseConnection && sseConnection.readyState !== EventSource.CLOSED) return;
+
+  chrome.storage.local.get(['extensionEnabled']).then(({ extensionEnabled }) => {
+    if (extensionEnabled === false) return; // Nếu bị tắt thì không tạo kết nối stream
+
+    remoteLog('Connecting to Server-Sent Events stream...');
+    sseConnection = new EventSource(CONFIG.SERVER_URL + '/api/extension/stream');
+
+    sseConnection.onopen = () => {
+      remoteLog('SSE connection established.', 'INFO');
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    };
+
+    sseConnection.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'ping') return; // Heartbeat
+
+        if (data.type === 'generate_link' && data.itemId) {
+          remoteLog(`[SSE] Received target link generation task instantly!`);
+          handleGenerateLink(data);
+        }
+      } catch (err) {
+        // Ignore parse error
+      }
+    };
+
+    sseConnection.onerror = (err) => {
+      sseConnection.close();
+      sseConnection = null;
+
+      // Auto reconnect sau 5s nếu bị rớt kết nối
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      reconnectTimeout = setTimeout(ensureSseConnection, 5000);
+    };
+  });
+}
+
 
 // ─── Helpers ───
 function remoteLog(msg, level = 'INFO') {
@@ -33,6 +78,14 @@ function generateSubId() {
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'TOGGLE_EXTENSION') {
     remoteLog(`Extension toggled: ${msg.enabled ? 'ON' : 'OFF'}`);
+    if (msg.enabled) {
+      ensureSseConnection();
+    } else {
+      if (sseConnection) {
+        sseConnection.close();
+        sseConnection = null;
+      }
+    }
   }
 });
 
@@ -60,8 +113,9 @@ async function pollForTasks() {
 }
 
 function startPolling() {
-  console.log('[BG-LIVE] Polling via chrome.alarms (every ~6s)...');
-  remoteLog('Extension Live started polling (alarm-based).');
+  console.log('[BG-LIVE] Polling via chrome.alarms (fallback every 1m)...');
+  remoteLog('Extension Live started (SSE + Fallback Polling).');
+  ensureSseConnection();
   pollForTasks();
 }
 
