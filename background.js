@@ -1,16 +1,19 @@
 importScripts('config.js');
 
-// ─── Keep-Alive ───
+// ─── Alarms: Keep-Alive + Polling ───
 chrome.alarms.create('keepAlive', { periodInMinutes: 0.25 });
+chrome.alarms.create('pollTasks', { periodInMinutes: 0.1 });
+
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'keepAlive') {
     chrome.runtime.getPlatformInfo(() => { });
+  } else if (alarm.name === 'pollTasks') {
+    pollForTasks();
   }
 });
 
 // Map requestId → pending request context
 const pendingRequests = new Map();
-let pollTimer = null;
 
 // ─── Helpers ───
 function remoteLog(msg, level = 'INFO') {
@@ -23,7 +26,7 @@ function remoteLog(msg, level = 'INFO') {
 }
 
 function generateSubId() {
-  return Math.random().toString(36).substring(2, 10) + Math.random().toString(36).substring(2, 10);
+  return 'ht24h' + Math.random().toString(36).substring(2, 10);
 }
 
 // ─── Toggle handler from popup ───
@@ -33,7 +36,7 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 });
 
-// ─── Polling for pending tasks (Vercel-compatible, replaces SSE) ───
+// ─── Polling for pending tasks ───
 async function pollForTasks() {
   try {
     const res = await fetch(CONFIG.SERVER_URL + '/api/extension/pending-tasks', {
@@ -52,21 +55,14 @@ async function pollForTasks() {
       }
     }
   } catch (err) {
-    // Silent fail — will retry on next poll
     console.log('[BG-LIVE] Poll error (will retry):', err.message);
   }
 }
 
 function startPolling() {
-  if (pollTimer) return;
-  console.log('[BG-LIVE] Starting polling (every 2s)...');
-  remoteLog('Extension Live started polling.');
-
-  // Initial poll
+  console.log('[BG-LIVE] Polling via chrome.alarms (every ~6s)...');
+  remoteLog('Extension Live started polling (alarm-based).');
   pollForTasks();
-
-  // Poll every 2 seconds
-  pollTimer = setInterval(pollForTasks, 2000);
 }
 
 // ─── Find or open affiliate.shopee.vn tab ───
@@ -75,14 +71,12 @@ async function getAffiliateTab() {
   if (tabs.length > 0) {
     return tabs[0];
   }
-  // Open a new tab
   remoteLog('No affiliate tab found. Opening one...');
   const newTab = await chrome.tabs.create({
     url: 'https://affiliate.shopee.vn/offer/custom_link',
     active: false
   });
 
-  // Wait for the page to load
   await new Promise((resolve) => {
     const listener = (tabId, info) => {
       if (tabId === newTab.id && info.status === 'complete') {
@@ -97,17 +91,137 @@ async function getAffiliateTab() {
     }, 15000);
   });
 
-  // Small extra delay for content scripts to inject
-  await new Promise(r => setTimeout(r, 2000));
+  await new Promise(r => setTimeout(r, 3000));
   return newTab;
+}
+
+// ─── Execute fetch in page context (like F12 console) ───
+async function executeInPage(tabId, itemId, shopId, subId, originalUrl, isShopeeFood) {
+  // Chạy code TRỰC TIẾP trong page context — giống hệt gõ trong F12 console
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: async (itemId, shopId, subId, originalUrl, isShopeeFood) => {
+      try {
+        if (isShopeeFood) {
+          // ─── SHOPEE FOOD LOGIC ───
+          const linkRes = await fetch('https://affiliate.shopee.vn/api/v3/gql?q=batchCustomLink', {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json; charset=UTF-8',
+              'affiliate-program-type': '1'
+            },
+            credentials: 'include',
+            body: JSON.stringify({
+              operationName: "batchGetCustomLink",
+              query: "\n    query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){\n      batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){\n        shortLink\n        longLink\n        failCode\n      }\n    }\n    ",
+              variables: {
+                linkParams: [{
+                  originalLink: originalUrl,
+                  advancedLinkParams: {
+                    subId1: subId
+                  }
+                }],
+                sourceCaller: "CUSTOM_LINK_CALLER"
+              }
+            })
+          }).then(r => r.json());
+
+          if (linkRes?.data?.batchCustomLink?.[0]?.shortLink) {
+            return {
+              success: true,
+              data: linkRes.data.batchCustomLink[0].shortLink,
+              productData: null
+            };
+          } else {
+            return { success: false, error: 'Shopee Food error: ' + JSON.stringify(linkRes) };
+          }
+        } else {
+          // ─── NORMAL SHOPEE LOGIC ───
+          // Helper format
+          const formatPrice = (p) => {
+            if (!p) return '';
+            return (parseInt(p) / 100000).toLocaleString('vi-VN') + '₫';
+          };
+          const formatImage = (id) => id ? `https://down-bs-vn.img.susercontent.com/${id}.webp` : '';
+
+          // Gọi song song: tạo link + lấy data sản phẩm
+          const [linkRes, productRes] = await Promise.all([
+            // 1. Tạo affiliate link
+            fetch('/api/v3/gql?q=productOfferLinks', {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json; charset=UTF-8',
+                'affiliate-program-type': '1'
+              },
+              credentials: 'include',
+              body: JSON.stringify({
+                operationName: "batchGetProductOfferLink",
+                query: 'query batchGetProductOfferLink($sourceCaller:SourceCaller!,$productOfferLinkParams:[ProductOfferLinkParam!]!,$advancedLinkParams:AdvancedLinkParams){productOfferLinks(productOfferLinkParams:$productOfferLinkParams,sourceCaller:$sourceCaller,advancedLinkParams:$advancedLinkParams){itemId shopId productOfferLink}}',
+                variables: {
+                  sourceCaller: "WEB_SITE_CALLER",
+                  productOfferLinkParams: [{
+                    itemId: String(itemId),
+                    shopId: shopId || 0,
+                    trace: '{"trace_id":"0.ext.100","list_type":100}'
+                  }],
+                  advancedLinkParams: { subId1: subId, subId2: "", subId3: "", subId4: "", subId5: "" }
+                }
+              })
+            }).then(r => r.json()),
+
+            // 2. Lấy thông tin sản phẩm  
+            fetch(`/api/v3/offer/product?item_id=${itemId}`, {
+              method: 'GET',
+              credentials: 'include',
+              headers: {
+                'accept': 'application/json, text/plain, */*',
+                'affiliate-program-type': '1'
+              }
+            }).then(r => r.json()).catch(() => null)
+          ]);
+
+          // Parse product data
+          let productData = null;
+          if (productRes && productRes.code === 0 && productRes.data) {
+            const item = productRes.data.batch_item_for_item_card_full;
+            if (item) {
+              productData = {
+                name: item.name || '',
+                image: formatImage(item.image),
+                price: formatPrice(item.price_min || item.price),
+                sold: item.historical_sold_text || item.sold_text || '',
+                cashback: productRes.data.commission || '',
+              };
+            }
+          }
+
+          // Parse link
+          if (linkRes.data?.productOfferLinks?.length > 0) {
+            return {
+              success: true,
+              data: linkRes.data.productOfferLinks[0].productOfferLink,
+              productData
+            };
+          } else {
+            return { success: false, error: 'Shopee error: ' + JSON.stringify(linkRes) };
+          }
+        }
+      } catch (e) {
+        return { success: false, error: e.message };
+      }
+    },
+    args: [itemId, shopId, subId, originalUrl, isShopeeFood]
+  });
+
+  return results?.[0]?.result || { success: false, error: 'executeScript failed' };
 }
 
 // ─── Core: Handle generate_link from server ───
 async function handleGenerateLink(data) {
-  // Check if extension is enabled
   const { extensionEnabled } = await chrome.storage.local.get(['extensionEnabled']);
   if (extensionEnabled === false) {
-    remoteLog('Extension is disabled. Skipping generate_link.');
+    remoteLog('Extension is disabled. Skipping.');
     return;
   }
 
@@ -122,75 +236,28 @@ async function handleGenerateLink(data) {
     }
 
     const subId = generateSubId();
-    pendingRequests.set(requestId, { requestId, userId, originalUrl, subId, tabId: tab.id });
+    remoteLog(`Executing in page context (tab ${tab.id})...`);
 
-    remoteLog(`Sending GENERATE_LINK to tab ${tab.id}...`);
+    const isShopeeFood = originalUrl && (originalUrl.includes('shopeefood') || originalUrl.includes('spf.shopee.vn'));
 
-    // Send message to content.js
-    try {
-      const response = await chrome.tabs.sendMessage(tab.id, {
-        type: 'GENERATE_LINK',
-        itemId: String(itemId),
-        shopId: shopId || 0,
-        requestId
+    // Chạy fetch TRỰC TIẾP trong page — giống F12 console
+    const response = await executeInPage(tab.id, itemId, shopId, subId, originalUrl, isShopeeFood);
+    remoteLog(`Result: ${JSON.stringify(response).substring(0, 200)}`);
+
+    if (response && response.success) {
+      sendResultToServer({
+        link: response.data,
+        productData: response.productData || null,
+        requestId,
+        subId,
+        originalUrl,
+        userId
       });
-
-      remoteLog(`Content script response: ${JSON.stringify(response)}`);
-
-      if (response && response.success) {
-        const ctx = pendingRequests.get(requestId);
-        if (ctx) {
-          sendResultToServer({
-            link: response.data,
-            productData: response.productData || null,
-            requestId: ctx.requestId,
-            subId: ctx.subId,
-            originalUrl: ctx.originalUrl,
-            userId: ctx.userId
-          });
-        }
-      } else {
-        remoteLog(`Generation failed: ${response?.error || 'Unknown'}`, 'ERROR');
-      }
-    } catch (msgErr) {
-      remoteLog(`Tab message error: ${msgErr.message}. Retrying...`, 'ERROR');
-
-      // Try reloading the tab and retrying once
-      await chrome.tabs.reload(tab.id);
-      await new Promise(r => setTimeout(r, 3000));
-
-      try {
-        const retryResponse = await chrome.tabs.sendMessage(tab.id, {
-          type: 'GENERATE_LINK',
-          itemId: String(itemId),
-          shopId: shopId || 0,
-          requestId
-        });
-
-        if (retryResponse && retryResponse.success) {
-          const ctx = pendingRequests.get(requestId);
-          if (ctx) {
-            sendResultToServer({
-              link: retryResponse.data,
-              productData: retryResponse.productData || null,
-              requestId: ctx.requestId,
-              subId: ctx.subId,
-              originalUrl: ctx.originalUrl,
-              userId: ctx.userId
-            });
-          }
-        } else {
-          remoteLog(`Retry also failed: ${retryResponse?.error || 'Unknown'}`, 'ERROR');
-        }
-      } catch (retryErr) {
-        remoteLog(`Retry failed: ${retryErr.message}`, 'ERROR');
-      }
+    } else {
+      remoteLog(`Generation failed: ${response?.error || 'Unknown'}`, 'ERROR');
     }
-
-    pendingRequests.delete(requestId);
   } catch (err) {
     remoteLog(`handleGenerateLink error: ${err.message}`, 'ERROR');
-    pendingRequests.delete(requestId);
   }
 }
 
@@ -219,4 +286,4 @@ function sendResultToServer({ link, productData, requestId, subId, originalUrl, 
 // ─── Start ───
 console.log('[BG-LIVE] Service Worker starting...');
 startPolling();
-remoteLog('Extension Live Background started (polling mode).');
+remoteLog('Extension Live Background started (executeScript mode).');

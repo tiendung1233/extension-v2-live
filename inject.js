@@ -1,5 +1,4 @@
 // MAIN world script — chạy trong context của trang affiliate.shopee.vn
-// fetch() ở đây dùng phiên bản đã được SDK patch (giống F12 console)
 
 // ─── Helper: Format price từ Shopee (chia 100000) ───
 function formatPrice(rawPrice) {
@@ -14,15 +13,22 @@ function formatImageUrl(imageId) {
   return `https://down-bs-vn.img.susercontent.com/${imageId}.webp`;
 }
 
+// ─── Helper: Get csrf token from cookie as fallback ───
+function getCsrfFromCookie() {
+  const m = document.cookie.match(/csrftoken=([^;]+)/);
+  return m ? m[1] : '';
+}
+
 // ─── Fetch product data từ affiliate API ───
-async function getProductData(itemId) {
+async function getProductData(itemId, secHeaders) {
   try {
     const res = await fetch(`/api/v3/offer/product?item_id=${itemId}`, {
       method: 'GET',
       credentials: 'include',
       headers: {
         'accept': 'application/json, text/plain, */*',
-        'affiliate-program-type': '1'
+        'affiliate-program-type': '1',
+        ...secHeaders
       }
     });
 
@@ -58,8 +64,17 @@ async function getProductData(itemId) {
 window.addEventListener('message', async (event) => {
   if (event.data?.type !== 'AFL_TASK') return;
 
-  const { requestId, itemId, shopId } = event.data;
+  const { requestId, itemId, shopId, securityHeaders } = event.data;
   console.log('[AFL-MAIN] Processing:', itemId, shopId);
+
+  // Build final headers: use headers from background (webRequest), fallback to cookie
+  const secHeaders = { ...(securityHeaders || {}) };
+  if (!secHeaders['csrf-token']) {
+    const csrf = getCsrfFromCookie();
+    if (csrf) secHeaders['csrf-token'] = csrf;
+  }
+
+  console.log('[AFL-MAIN] Headers:', Object.keys(secHeaders).join(', ') || 'NONE');
 
   try {
     // Gọi song song: tạo link + lấy data sản phẩm
@@ -69,7 +84,8 @@ window.addEventListener('message', async (event) => {
         method: 'POST',
         headers: {
           'content-type': 'application/json; charset=UTF-8',
-          'affiliate-program-type': '1'
+          'affiliate-program-type': '1',
+          ...secHeaders
         },
         credentials: 'include',
         body: JSON.stringify({
@@ -88,7 +104,7 @@ window.addEventListener('message', async (event) => {
       }).then(r => r.json()),
 
       // 2. Lấy thông tin sản phẩm
-      getProductData(itemId)
+      getProductData(itemId, secHeaders)
     ]);
 
     console.log('[AFL-MAIN] Link response:', linkResult);

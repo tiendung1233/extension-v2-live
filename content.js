@@ -6,6 +6,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   const requestId = msg.requestId || ('afl_' + Date.now());
   console.log('[AFL] Forwarding to MAIN world:', msg.itemId, 'reqId:', requestId);
+  console.log('[AFL] Security headers from BG:', Object.keys(msg.securityHeaders || {}));
 
   // Lắng nghe kết quả từ inject.js
   const handler = (event) => {
@@ -23,12 +24,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ success: false, error: 'Timeout 15s' });
   }, 15000);
 
-  // Gửi task đến inject.js (MAIN world) qua postMessage
+  // Gửi task đến inject.js (MAIN world) qua postMessage — include security headers
   window.postMessage({
     type: 'AFL_TASK',
     requestId,
     itemId: msg.itemId,
-    shopId: msg.shopId
+    shopId: msg.shopId,
+    securityHeaders: msg.securityHeaders || {}
   }, '*');
 
   return true; // giữ sendResponse async

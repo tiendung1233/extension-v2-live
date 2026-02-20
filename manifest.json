@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Shopee Affiliate Link Generator (Live)",
-  "version": "2.0",
+  "version": "2.1",
   "description": "Tạo link affiliate Shopee tự động từ Dashboard - Production",
   "permissions": ["activeTab", "tabs", "scripting", "alarms", "storage"],
   "host_permissions": [
@@ -13,18 +13,5 @@
   },
   "background": {
     "service_worker": "background.js"
-  },
-  "content_scripts": [
-    {
-      "matches": ["https://affiliate.shopee.vn/*"],
-      "js": ["content.js"],
-      "run_at": "document_idle"
-    },
-    {
-      "matches": ["https://affiliate.shopee.vn/*"],
-      "js": ["inject.js"],
-      "run_at": "document_idle",
-      "world": "MAIN"
-    }
-  ]
+  }
 }
