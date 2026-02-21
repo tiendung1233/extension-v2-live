@@ -19,6 +19,9 @@ const pendingRequests = new Map();
 // ─── Server-Sent Events (Real-time) ───
 let sseConnection = null;
 let reconnectTimeout = null;
+let watchdogInterval = null;
+let lastSseMessageTime = 0;
+const processedTasks = new Set(); // Stores requestId to prevent duplicate processing
 
 function ensureSseConnection() {
   if (sseConnection && sseConnection.readyState !== EventSource.CLOSED) return;
@@ -32,10 +35,15 @@ function ensureSseConnection() {
     sseConnection.onopen = () => {
       remoteLog('SSE connection established.', 'INFO');
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      lastSseMessageTime = Date.now(); // Reset watchdog timer on open
+      startWatchdog();
+      // Immediately poll in case tasks were missed during downtime
+      pollForTasks();
     };
 
     sseConnection.onmessage = (event) => {
       try {
+        lastSseMessageTime = Date.now(); // Update watchdog explicitly
         const data = JSON.parse(event.data);
         if (data.type === 'ping') return; // Heartbeat
 
@@ -49,14 +57,34 @@ function ensureSseConnection() {
     };
 
     sseConnection.onerror = (err) => {
-      sseConnection.close();
-      sseConnection = null;
-
-      // Auto reconnect sau 5s nếu bị rớt kết nối
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
-      reconnectTimeout = setTimeout(ensureSseConnection, 5000);
+      stopSseAndReconnect();
     };
   });
+}
+
+function stopSseAndReconnect() {
+  if (sseConnection) {
+    sseConnection.close();
+    sseConnection = null;
+  }
+  if (watchdogInterval) {
+    clearInterval(watchdogInterval);
+    watchdogInterval = null;
+  }
+  // Auto reconnect sau 5s nếu bị rớt kết nối
+  if (reconnectTimeout) clearTimeout(reconnectTimeout);
+  reconnectTimeout = setTimeout(ensureSseConnection, 5000);
+}
+
+function startWatchdog() {
+  if (watchdogInterval) clearInterval(watchdogInterval);
+  watchdogInterval = setInterval(() => {
+    // Nếu quá 40s không nhận được data/ping từ server (server ping mỗi 15s)
+    if (Date.now() - lastSseMessageTime > 40000) {
+      remoteLog('[SSE Watchdog] Connection silently dropped (no messages for >40s). Reconnecting...', 'WARNING');
+      stopSseAndReconnect();
+    }
+  }, 10000); // Check every 10s
 }
 
 
@@ -84,6 +112,10 @@ chrome.runtime.onMessage.addListener((msg) => {
       if (sseConnection) {
         sseConnection.close();
         sseConnection = null;
+      }
+      if (watchdogInterval) {
+        clearInterval(watchdogInterval);
+        watchdogInterval = null;
       }
     }
   }
@@ -280,6 +312,21 @@ async function handleGenerateLink(data) {
   }
 
   const { itemId, shopId, requestId, userId, originalUrl } = data;
+
+  // Deduplication check
+  if (processedTasks.has(requestId)) {
+    remoteLog(`Task ${requestId} already processed. Skipping duplicate.`);
+    return;
+  }
+  processedTasks.add(requestId);
+
+  // Keep max 100 requests in memory to avoid memory leak
+  if (processedTasks.size > 100) {
+    const iterator = processedTasks.values();
+    const firstOut = iterator.next().value;
+    processedTasks.delete(firstOut);
+  }
+
   remoteLog(`Processing: itemId=${itemId}, shopId=${shopId}, reqId=${requestId}`);
 
   try {
