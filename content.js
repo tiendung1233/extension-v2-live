@@ -36,4 +36,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true; // giữ sendResponse async
 });
 
+// Listen for WAKE_UP_POLLING from the React dashboard
+window.addEventListener('message', (event) => {
+  if (event.source !== window || !event.data || typeof event.data !== 'object') return;
+
+  if (event.data.type === 'WAKE_UP_POLLING') {
+    console.log('[AFL] WAKE_UP_POLLING received from page, forwarding to background');
+    chrome.runtime.sendMessage({ type: 'WAKE_UP_POLLING' }).catch(err => {
+      console.warn('[AFL] Could not wake up background worker:', err);
+    });
+  }
+});
+
 console.log('[AFL] Content script (ISOLATED) loaded ✅');

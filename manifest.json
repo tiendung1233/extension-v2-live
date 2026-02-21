@@ -13,5 +13,17 @@
   },
   "background": {
     "service_worker": "background.js"
-  }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://localhost/*",
+        "https://affiliateserver.vercel.app/*",
+        "https://hoantien24h.com/*",
+        "https://*.hoantien24h.com/*"
+      ],
+      "js": ["content.js"]
+    }
+  ]
 }
+  
