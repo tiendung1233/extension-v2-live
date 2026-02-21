@@ -1,92 +1,38 @@
 importScripts('config.js');
 
-// ─── Alarms: Keep-Alive + Polling (Fallback only) ───
-chrome.alarms.create('keepAlive', { periodInMinutes: 0.25 });
-chrome.alarms.create('pollTasks', { periodInMinutes: 1.0 }); // Giảm polling xuống 1 phút vì đã dùng SSE
+// ─── Alarms: Polling ───
+chrome.alarms.create('pollTasks', { periodInMinutes: 0.5 }); // Poll every 30s as baseline fallback
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'keepAlive') {
-    chrome.runtime.getPlatformInfo(() => { });
-    ensureSseConnection(); // Giữ kết nối SSE khi keep-alive chạy
-  } else if (alarm.name === 'pollTasks') {
+  if (alarm.name === 'pollTasks') {
     pollForTasks();
   }
 });
 
 // Map requestId → pending request context
 const pendingRequests = new Map();
-
-// ─── Server-Sent Events (Real-time) ───
-let sseConnection = null;
-let reconnectTimeout = null;
-let watchdogInterval = null;
-let lastSseMessageTime = 0;
 const processedTasks = new Set(); // Stores requestId to prevent duplicate processing
+let aggressivePollingInterval = null;
 
-function ensureSseConnection() {
-  if (sseConnection && sseConnection.readyState !== EventSource.CLOSED) return;
+// ─── Smart Aggressive Polling ───
+// Khi được bật, sẽ poll liên tục mỗi 3 giây trong vòng 60 giây rồi tắt để tiết kiệm quota
+function startAggressivePolling() {
+  if (aggressivePollingInterval) clearInterval(aggressivePollingInterval);
+  remoteLog('Started aggressive polling (3s interval) for 60 seconds.');
 
-  chrome.storage.local.get(['extensionEnabled']).then(({ extensionEnabled }) => {
-    if (extensionEnabled === false) return; // Nếu bị tắt thì không tạo kết nối stream
+  let ticks = 0;
+  pollForTasks(); // Poll right away
 
-    remoteLog('Connecting to Server-Sent Events stream...');
-    sseConnection = new EventSource(CONFIG.SERVER_URL + '/api/extension/stream');
-
-    sseConnection.onopen = () => {
-      remoteLog('SSE connection established.', 'INFO');
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
-      lastSseMessageTime = Date.now(); // Reset watchdog timer on open
-      startWatchdog();
-      // Immediately poll in case tasks were missed during downtime
-      pollForTasks();
-    };
-
-    sseConnection.onmessage = (event) => {
-      try {
-        lastSseMessageTime = Date.now(); // Update watchdog explicitly
-        const data = JSON.parse(event.data);
-        if (data.type === 'ping') return; // Heartbeat
-
-        if (data.type === 'generate_link' && data.itemId) {
-          remoteLog(`[SSE] Received target link generation task instantly!`);
-          handleGenerateLink(data);
-        }
-      } catch (err) {
-        // Ignore parse error
-      }
-    };
-
-    sseConnection.onerror = (err) => {
-      stopSseAndReconnect();
-    };
-  });
-}
-
-function stopSseAndReconnect() {
-  if (sseConnection) {
-    sseConnection.close();
-    sseConnection = null;
-  }
-  if (watchdogInterval) {
-    clearInterval(watchdogInterval);
-    watchdogInterval = null;
-  }
-  // Auto reconnect sau 5s nếu bị rớt kết nối
-  if (reconnectTimeout) clearTimeout(reconnectTimeout);
-  reconnectTimeout = setTimeout(ensureSseConnection, 5000);
-}
-
-function startWatchdog() {
-  if (watchdogInterval) clearInterval(watchdogInterval);
-  watchdogInterval = setInterval(() => {
-    // Nếu quá 40s không nhận được data/ping từ server (server ping mỗi 15s)
-    if (Date.now() - lastSseMessageTime > 40000) {
-      remoteLog('[SSE Watchdog] Connection silently dropped (no messages for >40s). Reconnecting...', 'WARNING');
-      stopSseAndReconnect();
+  aggressivePollingInterval = setInterval(() => {
+    ticks++;
+    pollForTasks();
+    if (ticks >= 20) { // 20 * 3s = 60s
+      clearInterval(aggressivePollingInterval);
+      aggressivePollingInterval = null;
+      remoteLog('Aggressive polling ended. Falling back to background alarms.');
     }
-  }, 10000); // Check every 10s
+  }, 3000);
 }
-
 
 // ─── Helpers ───
 function remoteLog(msg, level = 'INFO') {
@@ -107,22 +53,24 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'TOGGLE_EXTENSION') {
     remoteLog(`Extension toggled: ${msg.enabled ? 'ON' : 'OFF'}`);
     if (msg.enabled) {
-      ensureSseConnection();
+      pollForTasks();
     } else {
-      if (sseConnection) {
-        sseConnection.close();
-        sseConnection = null;
-      }
-      if (watchdogInterval) {
-        clearInterval(watchdogInterval);
-        watchdogInterval = null;
+      if (aggressivePollingInterval) {
+        clearInterval(aggressivePollingInterval);
+        aggressivePollingInterval = null;
       }
     }
+  } else if (msg.type === 'WAKE_UP_POLLING') {
+    // Client can broadcast a wake-up to the extension if they're on the same machine
+    startAggressivePolling();
   }
 });
 
 // ─── Polling for pending tasks ───
 async function pollForTasks() {
+  const { extensionEnabled } = await chrome.storage.local.get(['extensionEnabled']);
+  if (extensionEnabled === false) return; // Nếu bị tắt thì không poll
+
   try {
     const res = await fetch(CONFIG.SERVER_URL + '/api/extension/pending-tasks', {
       headers: { 'Accept': 'application/json' }
@@ -140,15 +88,14 @@ async function pollForTasks() {
       }
     }
   } catch (err) {
-    console.log('[BG-LIVE] Poll error (will retry):', err.message);
+    console.log('[BG-LIVE] Poll error:', err.message);
   }
 }
 
 function startPolling() {
-  console.log('[BG-LIVE] Polling via chrome.alarms (fallback every 1m)...');
-  remoteLog('Extension Live started (SSE + Fallback Polling).');
-  ensureSseConnection();
-  pollForTasks();
+  console.log('[BG-LIVE] Polling started...');
+  remoteLog('Extension Live started (Polling Mode).');
+  startAggressivePolling(); // Start hot aggressively on boot
 }
 
 // ─── Find or open affiliate.shopee.vn tab ───
